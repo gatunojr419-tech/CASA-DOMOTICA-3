@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Monitoreo BLE — Sala/Cocina/Patio/Garaje</title>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.3.0/dist/chart.umd.min.js"></script>
+
+  <style>
+    :root{
+      --bg:#f6f7fb; --card:#fff; --muted:#6b7280;
+    }
+    body{font-family:Inter, Roboto, Arial; background:var(--bg); margin:0; padding:20px; color:#111}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+    h1{margin:0;font-size:20px}
+    .status{font-size:14px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(1,1fr);gap:12px}
+    @media(min-width:900px){.grid{grid-template-columns:repeat(4,1fr)}}
+    .card{background:var(--card);padding:14px;border-radius:10px;box-shadow:0 6px 18px rgba(15,23,42,0.06);display:flex;flex-direction:column;align-items:center}
+    .loc{font-weight:700}
+    .temp{font-size:36px;margin-top:6px}
+    .badge{padding:6px 10px;border-radius:20px;margin-top:8px;font-weight:600;color:white}
+    .low{background:#3b82f6}      /* azul */
+    .medium{background:#10b981}   /* verde */
+    .normal{background:#111827}   /* negro */
+    .high{background:#ef4444}     /* rojo */
+    .controls{display:flex;gap:10px;align-items:center;margin-top:14px}
+    button{padding:10px 14px;border-radius:10px;border:0;cursor:pointer;background:#111827;color:#fff}
+    button.secondary{background:#6b7280}
+    main{max-width:1100px;margin:auto}
+    .big{display:grid;grid-template-columns:1fr;gap:12px;margin-top:18px}
+    @media(min-width:900px){.big{grid-template-columns:320px 1fr}}
+    .panel{background:var(--card);padding:14px;border-radius:10px;box-shadow:0 6px 18px rgba(15,23,42,0.06)}
+    canvas{width:100% !important; height:320px !important;}
+    .small-note{font-size:12px;color:var(--muted);margin-top:8px}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Monitoreo BLE — Sala · Cocina · Patio · Garaje</h1>
+        <div class="status" id="statusText">Estado: DESCONECTADO</div>
+      </div>
+      <div class="controls">
+        <button id="connectBtn" onclick="toggleConnection()">Conectar BLE</button>
+        <button class="secondary" id="simBtn" onclick="toggleSimulation()">Simular</button>
+      </div>
+    </header>
+
+    <!-- Tarjetas -->
+    <section class="grid" aria-label="Sensores">
+      <div class="card">
+        <div class="loc">SALA</div>
+        <div class="temp" id="val-sala">-- °C</div>
+        <div id="badge-sala" class="badge normal">--</div>
+      </div>
+
+      <div class="card">
+        <div class="loc">COCINA</div>
+        <div class="temp" id="val-cocina">-- °C</div>
+        <div id="badge-cocina" class="badge normal">--</div>
+      </div>
+
+      <div class="card">
+        <div class="loc">PATIO</div>
+        <div class="temp" id="val-patio">-- °C</div>
+        <div id="badge-patio" class="badge normal">--</div>
+      </div>
+
+      <div class="card">
+        <div class="loc">GARAJE</div>
+        <div class="temp" id="val-garaje">-- °C</div>
+        <div id="badge-garaje" class="badge normal">--</div>
+      </div>
+    </section>
+
+    <!-- Promedio + Grafica -->
+    <section class="big">
+      <div class="panel">
+        <div class="loc">PROMEDIO</div>
+        <div class="temp" id="val-prom">-- °C</div>
+        <div id="badge-prom" class="badge normal">--</div>
+        <div class="small-note">Alertas: Baja &lt;10°C · Media 10–15°C · Alta &gt;38°C</div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div class="loc">Gráfico (últimas 20 muestras)</div>
+          <div class="small-note">Actualización en tiempo real</div>
+        </div>
+        <canvas id="chartMain"></canvas>
+      </div>
+    </section>
+  </main>
+
+<script>
+// ---------- CONFIG ----------
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const CHAR_UUID    = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const MAX_SAMPLES  = 20;   // <-- ventana deslizante de 20 muestras
+const INTERVAL_MS  = 2000; // periodo esperado de datos (no forzamos lectura)
+const UMBRAL_BAJA  = 10.0;
+const UMBRAL_MEDIA = 15.0;
+const UMBRAL_ALTA  = 38.0;
+
+// ---------- ESTADO ----------
+let bleDevice = null;
+let bleChar = null;
+let connected = false;
+let simMode = false;
+let simInterval = null;
+
+// Buffers para la gráfica (FIFO)
+const labels = [];
+const buf = { sala:[], cocina:[], patio:[], garaje:[], prom:[] };
+
+// UI refs
+const statusText = document.getElementById('statusText');
+const connectBtn = document.getElementById('connectBtn');
+const simBtn = document.getElementById('simBtn');
+
+// actualizar estado visual de badge
+function setBadge(idBadge, value){
+  const el = document.getElementById(idBadge);
+  el.className = 'badge';
+  if (!isFinite(value)) {
+    el.textContent = '--';
+    el.classList.add('normal');
+    return;
+  }
+  if (value < UMBRAL_BAJA) { el.textContent = 'BAJA'; el.classList.add('low'); }
+  else if (value < UMBRAL_MEDIA) { el.textContent = 'MEDIA'; el.classList.add('medium'); }
+  else if (value > UMBRAL_ALTA) { el.textContent = 'ALTA'; el.classList.add('high'); }
+  else { el.textContent = 'NORMAL'; el.classList.add('normal'); }
+}
+
+// actualizar valor numérico
+function setTempText(idEl, value){
+  const el = document.getElementById(idEl);
+  if (!isFinite(value)) el.textContent = '-- °C';
+  else el.textContent = value.toFixed(1) + ' °C';
+}
+
+// ---------- CHART.JS ----------
+const ctx = document.getElementById('chartMain').getContext('2d');
+const mainChart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: labels,
+    datasets: [
+      { label: 'Sala',  data: buf.sala,  borderColor: '#2563eb', tension: 0.3, pointRadius:0 },
+      { label: 'Cocina', data: buf.cocina, borderColor: '#ef4444', tension: 0.3, pointRadius:0 },
+      { label: 'Patio',  data: buf.patio,  borderColor: '#06b6d4', tension: 0.3, pointRadius:0 },
+      { label: 'Garaje', data: buf.garaje, borderColor: '#7c3aed', tension: 0.3, pointRadius:0 },
+      { label: 'Promedio',data: buf.prom,   borderColor: '#10b981', tension: 0.3, borderDash:[6,4], pointRadius:0 }
+    ]
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      y: { suggestedMin: -5, suggestedMax: 50 }
+    },
+    plugins: { legend: { position:'top' } }
+  }
+});
+
+// push sample (mantiene MAX_SAMPLES)
+function pushSample(sala, cocina, patio, garaje){
+  const now = new Date().toLocaleTimeString();
+  labels.push(now);
+  if (labels.length > MAX_SAMPLES) labels.shift();
+
+  const prom = average([sala, cocina, patio, garaje]);
+
+  pushBuf(buf.sala, sala);
+  pushBuf(buf.cocina, cocina);
+  pushBuf(buf.patio, patio);
+  pushBuf(buf.garaje, garaje);
+  pushBuf(buf.prom, prom);
+
+  // sincronizar chart
+  mainChart.data.labels = labels;
+  mainChart.update();
+
+  // actualizar UI numérica y badges
+  setTempText('val-sala', sala);   setBadge('badge-sala', sala);
+  setTempText('val-cocina', cocina); setBadge('badge-cocina', cocina);
+  setTempText('val-patio', patio); setBadge('badge-patio', patio);
+  setTempText('val-garaje', garaje); setBadge('badge-garaje', garaje);
+
+  setTempText('val-prom', prom); setBadge('badge-prom', prom);
+}
+
+function pushBuf(array, val){
+  array.push(isFinite(val) ? val : NaN);
+  if (array.length > MAX_SAMPLES) array.shift();
+}
+
+function average(arr){
+  const nums = arr.filter(x => isFinite(x));
+  if (nums.length === 0) return NaN;
+  return nums.reduce((a,b)=>a+b,0)/nums.length;
+}
+
+// ---------- BLE (Web Bluetooth) ----------
+async function toggleConnection(){
+  if (connected) { disconnect(); return; }
+  await connect();
+}
+
+async function connect(){
+  try{
+    statusText.textContent = 'Estado: BUSCANDO...';
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'TUVN_Termometros' }], // si tu ESP tiene otro nombre, cámbialo
+      optionalServices: [SERVICE_UUID]
+    });
+    bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    bleChar = await service.getCharacteristic(CHAR_UUID);
+
+    await bleChar.startNotifications();
+    bleChar.addEventListener('characteristicvaluechanged', handleNotifications);
+
+    connected = true;
+    statusText.textContent = 'Estado: CONECTADO';
+    connectBtn.textContent = 'Desconectar';
+  } catch(err){
+    console.error('BLE connect error', err);
+    statusText.textContent = 'Estado: ERROR';
+    alert('Error conexión BLE: ' + (err.message || err));
+  }
+}
+
+function disconnect(){
+  if (!bleDevice) return;
+  try { bleDevice.gatt.disconnect(); } catch(e) {}
+  onDisconnected();
+}
+
+function onDisconnected(){
+  connected = false;
+  statusText.textContent = 'Estado: DESCONECTADO';
+  connectBtn.textContent = 'Conectar BLE';
+}
+
+// Manejar notificaciones BLE (espera JSON en UTF-8)
+function handleNotifications(event){
+  try {
+    const value = event.target.value;
+    const decoder = new TextDecoder('utf-8');
+    const text = decoder.decode(value).trim();
+    // console.log('BLE raw:', text);
+    const obj = JSON.parse(text);
+
+    // leer nombres esperados: sala, cocina, patio, garaje (prom opcional)
+    const sala = obj.sala !== undefined ? parseFloat(obj.sala) : NaN;
+    const cocina = obj.cocina !== undefined ? parseFloat(obj.cocina) : NaN;
+    const patio = obj.patio !== undefined ? parseFloat(obj.patio) : NaN;
+    const garaje = obj.garaje !== undefined ? parseFloat(obj.garaje) : NaN;
+
+    pushSample(sala, cocina, patio, garaje);
+
+  } catch(e){
+    console.error('Error parseando notificación BLE:', e);
+  }
+}
+
+// ---------- SIMULACIÓN ----------
+function toggleSimulation(){
+  if (simMode) { stopSimulation(); }
+  else { startSimulation(); }
+}
+
+function startSimulation(){
+  simMode = true;
+  simBtn.textContent = 'Detener simulación';
+  statusText.textContent = 'Estado: SIMULANDO';
+  simInterval = setInterval(()=> {
+    const sala = 12 + Math.random()*20;
+    const cocina = 14 + Math.random()*18;
+    const patio = 5 + Math.random()*25;
+    const garaje = 10 + Math.random()*18;
+    pushSample(sala, cocina, patio, garaje);
+  }, INTERVAL_MS);
+}
+
+function stopSimulation(){
+  simMode = false;
+  simBtn.textContent = 'Simular';
+  statusText.textContent = connected ? 'Estado: CONECTADO' : 'Estado: DESCONECTADO';
+  clearInterval(simInterval);
+}
+
+// Uncomment to auto-start simulation while testing (if you don't want to press Simular)
+// simulateData();
+// function simulateData(){ startSimulation(); }
+
+// ---------- FIN ----------
+</script>
+</body>
+</html>
